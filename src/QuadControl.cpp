@@ -7,6 +7,7 @@
 #include "Trajectory.h"
 #include "BaseController.h"
 #include "Math/Mat3x3F.h"
+#include <time.h>
 
 #ifdef __PX4_NUTTX
 #include <systemlib/param/param.h>
@@ -18,15 +19,17 @@ void QuadControl::Init()
 
   // variables needed for integral control
   integratedAltitudeError = 0;
+  counter = 0;
+  lastt = 0;
     
 #ifndef __PX4_NUTTX
   // Load params from simulator parameter system
   ParamsHandle config = SimpleConfig::GetInstance();
    
   // Load parameters (default to 0)
-  kpPosXY = config->Get(_config+".kpPosXY", 0);
+  kpPosXY = config->Get(_config + ".kpPosXY", 0);
   kpPosZ = config->Get(_config + ".kpPosZ", 0);
-  KiPosZ = config->Get(_config + ".KiPosZ", 0);
+  kiPosZ = config->Get(_config + ".kiPosZ", 0);
      
   kpVelXY = config->Get(_config + ".kpVelXY", 0);
   kpVelZ = config->Get(_config + ".kpVelZ", 0);
@@ -58,22 +61,29 @@ VehicleCommand QuadControl::GenerateMotorCommands(float collThrustCmd, V3F momen
   // Convert a desired 3-axis moment and collective thrust command to 
   //   individual motor thrust commands
   // INPUTS: 
-  //   desCollectiveThrust: desired collective thrust [N]
-  //   desMoment: desired rotation moment about each axis [N m]
+  //   collThrustCmd: desired collective thrust [N]
+  //   momentCmd: desired rotation moment about each axis [N m]
   // OUTPUT:
   //   set class member variable cmd (class variable for graphing) where
   //   cmd.desiredThrustsN[0..3]: motor commands, in [N]
 
   // HINTS: 
-  // - you can access parts of desMoment via e.g. desMoment.x
-  // You'll need the arm length parameter L, and the drag/thrust ratio kappa
+  // Access parts of momentCmd via e.g. momentCmd.x
+  // You'll need the arm length parameter L, and the value kappa [m]:
+  // torque (Nm) produced by motor per N of thrust generated.
 
   ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
 
-  cmd.desiredThrustsN[0] = mass * 9.81f / 4.f; // front left
-  cmd.desiredThrustsN[1] = mass * 9.81f / 4.f; // front right
-  cmd.desiredThrustsN[2] = mass * 9.81f / 4.f; // rear left
-  cmd.desiredThrustsN[3] = mass * 9.81f / 4.f; // rear right
+  float idealThrust = collThrustCmd / 4.f;
+  float d = 4.f * L * M_SQRT1_2; // adjust L to be l
+  float p = momentCmd.x / d;
+  float q = momentCmd.y / d;
+  float r = momentCmd.z / (kappa*4.f);
+
+  cmd.desiredThrustsN[0] = idealThrust + p + q - r; // front left  F1
+  cmd.desiredThrustsN[1] = idealThrust - p + q + r; // front right F2
+  cmd.desiredThrustsN[2] = idealThrust + p - q + r; // rear left   F4
+  cmd.desiredThrustsN[3] = idealThrust - p - q - r; // rear right  F3
 
   /////////////////////////////// END STUDENT CODE ////////////////////////////
 
@@ -98,42 +108,17 @@ V3F QuadControl::BodyRateControl(V3F pqrCmd, V3F pqr)
 
   ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
 
-  
+  V3F I = V3F(Ixx, Iyy, Izz);
+  // Account for the moment of inertia of the drone
+  momentCmd = I * kpPQR * (pqrCmd - pqr);
+  // Gate the moment if necessary
+  float maxTorque = 6.28f;
+  if (momentCmd.mag() > maxTorque)
+    momentCmd = momentCmd * maxTorque / momentCmd.mag();
 
   /////////////////////////////// END STUDENT CODE ////////////////////////////
 
   return momentCmd;
-}
-
-// returns a desired roll and pitch rate 
-V3F QuadControl::RollPitchControl(V3F accelCmd, Quaternion<float> attitude, float collThrustCmd)
-{
-  // Calculate a desired pitch and roll angle rates based on a desired global
-  //   lateral acceleration, the current attitude of the quad, and desired
-  //   collective thrust command
-  // INPUTS: 
-  //   accelCmd: desired acceleration in global XY coordinates [m/s2]
-  //   attitude: current or estimated attitude of the vehicle
-  //   collThrustCmd: desired collective thrust of the quad [N]
-  // OUTPUT:
-  //   return a V3F containing the desired pitch and roll rates. The Z
-  //     element of the V3F should be left at its default value (0)
-
-  // HINTS: 
-  //  - we already provide rotation matrix R: to get element R[1,2] (python) use R(1,2) (C++)
-  //  - you'll need the roll/pitch gain kpBank
-  //  - collThrustCmd is a force in Newtons! You'll likely want to convert it to acceleration first
-
-  V3F pqrCmd;
-  Mat3x3F R = attitude.RotationMatrix_IwrtB();
-
-  ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
-
-
-
-  /////////////////////////////// END STUDENT CODE ////////////////////////////
-
-  return pqrCmd;
 }
 
 float QuadControl::AltitudeControl(float posZCmd, float velZCmd, float posZ, float velZ, Quaternion<float> attitude, float accelZCmd, float dt)
@@ -157,15 +142,95 @@ float QuadControl::AltitudeControl(float posZCmd, float velZCmd, float posZ, flo
   //  - remember that for an upright quad in NED, thrust should be HIGHER if the desired Z acceleration is LOWER
 
   Mat3x3F R = attitude.RotationMatrix_IwrtB();
-  float thrust = 0;
+  float thrust = 0.f;
 
   ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
 
-
+  float err_z = posZCmd - posZ; // Proportion p component
+  integratedAltitudeError += err_z * dt;
+  // Experiment: prevent integral wind-up
+  //if (abs(integratedAltitudeError) > 0.25)
+  //  integratedAltitudeError = 0;
+  float newAcc = kpPosZ * err_z + kpVelZ * (velZCmd - velZ) // add deriv d component
+    + kiPosZ * integratedAltitudeError + accelZCmd;         // and i component
+  // Gate the acceleration if necessary
+  newAcc = CONSTRAIN(newAcc, -maxAscentRate / dt, maxDescentRate / dt);
+  float acc = (newAcc - float(CONST_GRAVITY)) / R(2,2);
+  thrust = -acc * mass; // convert to thrust force [N]
 
   /////////////////////////////// END STUDENT CODE ////////////////////////////
-  
+
   return thrust;
+}
+
+// returns a desired roll and pitch rate 
+V3F QuadControl::RollPitchControl(V3F accelCmd, Quaternion<float> attitude, float collThrustCmd)
+{
+  // Calculate a desired pitch and roll angle rates based on a desired global
+  //   lateral acceleration, the current attitude of the quad, and desired
+  //   collective thrust command
+  // INPUTS: 
+  //   accelCmd: desired acceleration in global XY coordinates [m/s2]
+  //   attitude: current or estimated attitude of the vehicle
+  //   collThrustCmd: desired collective thrust of the quad [N]
+  // OUTPUT:
+  //   return a V3F containing the desired pitch and roll rates. The Z
+  //     element of the V3F should be left at its default value (0)
+
+  // HINTS: 
+  //  - we already provide rotation matrix R: to get element R[1,2] (python) use R(1,2) (C++)
+  //  - you'll need the roll/pitch gain kpBank
+  //  - collThrustCmd is a force in newtons! You'll likely want to convert it to acceleration first
+
+  V3F pqrCmd;
+  Mat3x3F R = attitude.RotationMatrix_IwrtB();
+
+  ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
+
+  // Account for drone mass (factor out for acceleration)
+  float acc = collThrustCmd / mass;
+  // Gate the tilt angle (approximately)
+  float bx_targ = -CONSTRAIN(accelCmd.x / acc, -maxTiltAngle, maxTiltAngle);
+  float by_targ = -CONSTRAIN(accelCmd.y / acc, -maxTiltAngle, maxTiltAngle);
+  // Calculate angular velocity
+  float bxd = kpBank * (bx_targ - R(0,2));
+  float byd = kpBank * (by_targ - R(1,2));
+  pqrCmd.x = (R(1,0) * bxd - R(1,1) * byd) / R(2,2);
+  pqrCmd.y = (R(0,0) * bxd - R(0,1) * byd) / R(2,2);
+
+  /////////////////////////////// END STUDENT CODE ////////////////////////////
+
+  return pqrCmd;
+}
+
+// returns desired yaw rate
+float QuadControl::YawControl(float yawCmd, float yaw)
+{
+  // Calculate a desired yaw rate to control yaw to yawCmd
+  // INPUTS: 
+  //   yawCmd: commanded yaw [rad]
+  //   yaw: current yaw [rad]
+  // OUTPUT:
+  //   return a desired yaw rate [rad/s]
+  // HINTS: 
+  //  - use fmodf(foo,b) to constrain float foo to range [0,b]
+  //  - use the yaw control gain parameter kpYaw
+
+  float yawRateCmd = 0.f;
+  ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
+
+  // Constrain to valid yaw range of -pi to pi
+  float errYaw = yawCmd - yaw;
+  if (errYaw > float(M_PI))
+    errYaw = errYaw - 2.f * float(M_PI);
+  else if (errYaw < -float(M_PI))
+    errYaw = errYaw + 2.f * float(M_PI);
+  yawRateCmd = kpYaw * errYaw;
+
+  /////////////////////////////// END STUDENT CODE ////////////////////////////
+
+  return yawRateCmd;
+
 }
 
 // returns a desired acceleration in global frame
@@ -189,44 +254,39 @@ V3F QuadControl::LateralPositionControl(V3F posCmd, V3F velCmd, V3F pos, V3F vel
   //    to maxSpeedXY and maxAccelXY
 
   // make sure we don't have any incoming z-component
-  accelCmd.z = 0;
-  velCmd.z = 0;
+  accelCmd.z = 0.f;
+  velCmd.z = 0.f;
   posCmd.z = pos.z;
 
   ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
 
-  
+  V3F kpP(kpPosXY, kpPosXY, 0.f); // do not apply gain to z-component
+  V3F kdV(kpVelXY, kpVelXY, 0.f);
+  // Not found to be needed here, but: constrain velocity target
+  //if (velCmd.mag() > maxSpeedXY)
+  //  velCmd = velCmd * maxSpeedXY / velCmd.mag();
+
+  // Compute acceleration
+  accelCmd += kpP * (posCmd - pos) + kdV * (velCmd - vel);
+
+  // Constrain computed acceleration
+  if (accelCmd.mag() > maxAccelXY)
+    accelCmd = accelCmd * maxAccelXY / accelCmd.mag();
 
   /////////////////////////////// END STUDENT CODE ////////////////////////////
 
   return accelCmd;
 }
 
-// returns desired yaw rate
-float QuadControl::YawControl(float yawCmd, float yaw)
-{
-  // Calculate a desired yaw rate to control yaw to yawCmd
-  // INPUTS: 
-  //   yawCmd: commanded yaw [rad]
-  //   yaw: current yaw [rad]
-  // OUTPUT:
-  //   return a desired yaw rate [rad/s]
-  // HINTS: 
-  //  - use fmodf(foo,b) to constrain float foo to range [0,b]
-  //  - use the yaw control gain parameter kpYaw
-
-  float yawRateCmd=0;
-  ////////////////////////////// BEGIN STUDENT CODE ///////////////////////////
-
-
-  /////////////////////////////// END STUDENT CODE ////////////////////////////
-
-  return yawRateCmd;
-
-}
-
 VehicleCommand QuadControl::RunControl(float dt, float simTime)
 {
+/*int t = time(NULL);
+  counter += 1;
+  if (t != lastt) {
+    cout << counter << endl;
+    counter = 0;
+  }
+  lastt = t; */
   curTrajPoint = GetNextTrajectoryPoint(simTime);
 
   float collThrustCmd = AltitudeControl(curTrajPoint.position.z, curTrajPoint.velocity.z, estPos.z, estVel.z, estAtt, curTrajPoint.accel.z, dt);

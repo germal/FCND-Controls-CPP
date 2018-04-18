@@ -36,7 +36,7 @@ public:
   float kpPosXY, kpPosZ;
   float kpVelXY, kpVelZ;
   float kpBank, kpYaw;
-  float KiPosZ;
+  float kiPosZ;
   V3F kpPQR;
   
   // limits & saturations
@@ -48,4 +48,6 @@ public:
 
   // integral control
   float integratedAltitudeError;
+  int counter;
+  int lastt;
 };
